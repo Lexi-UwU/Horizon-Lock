@@ -3,15 +3,16 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Horizon Lock Lite</title>
+  <title>HORIZON LOCK V2</title>
   <style>
-    body { margin: 0; background: #000; color: #00ff88; font-family: monospace; overflow: hidden; }
+    :root { --neon: #00ff88; --bg: #050806; }
+    body { margin: 0; background: var(--bg); color: var(--neon); font-family: 'Courier New', monospace; overflow: hidden; height: 100vh; }
     
-    /* The Camera Container */
-    #container {
+    #viewfinder {
       position: relative;
       width: 100vw;
       height: 100vh;
+      overflow: hidden;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -19,86 +20,148 @@
 
     video {
       position: absolute;
-      min-width: 130%; /* Oversized so edges don't show when rotating */
+      /* Over-scale to 1.3x to prevent black edges during rotation */
+      min-width: 130%;
       min-height: 130%;
       object-fit: cover;
-      transition: transform 0.1s linear;
+      pointer-events: none;
     }
 
-    /* HUD Overlay */
-    #hud {
+    /* HUD elements */
+    #hud-layer {
       position: absolute;
       inset: 0;
-      border: 2px solid rgba(0, 255, 136, 0.2);
-      pointer-events: none;
+      z-index: 10;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      padding: 20px;
-      z-index: 10;
+      padding: 30px;
+      pointer-events: none;
+      box-sizing: border-box;
     }
 
-    .horizon-wire {
+    .horizon-line {
       position: absolute;
-      top: 50%; left: 10%; right: 10%;
+      top: 50%; left: 15%; right: 15%;
       height: 1px;
-      background: #00ff88;
-      box-shadow: 0 0 10px #00ff88;
+      background: var(--neon);
+      box-shadow: 0 0 15px var(--neon);
+      opacity: 0.6;
     }
 
-    #stats { font-size: 1.2rem; text-shadow: 0 0 5px #000; }
-    #btn-init {
-      position: absolute; z-index: 20;
-      padding: 15px 30px; background: #00ff88; border: none;
-      font-weight: bold; cursor: pointer; top: 50%; left: 50%;
+    .crosshair {
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 20px; height: 20px;
       transform: translate(-50%, -50%);
+      border: 1px solid var(--neon);
+      border-radius: 50%;
     }
+
+    #readout { font-size: 0.9rem; letter-spacing: 2px; text-shadow: 0 0 5px #000; }
+
+    #overlay {
+      position: fixed; inset: 0;
+      background: var(--bg);
+      z-index: 100;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      text-align: center;
+    }
+
+    button {
+      background: transparent; border: 1px solid var(--neon);
+      color: var(--neon); padding: 15px 40px;
+      font-family: inherit; cursor: pointer;
+      font-size: 1rem; margin-top: 20px;
+      transition: all 0.3s;
+    }
+    button:hover { background: rgba(0, 255, 136, 0.1); box-shadow: 0 0 20px var(--neon); }
   </style>
 </head>
 <body>
 
-  <button id="btn-init">START SYSTEM</button>
+  <div id="overlay">
+    <h1 style="letter-spacing: 8px;">HORIZON LOCK</h1>
+    <p style="opacity: 0.6; font-size: 0.8rem;">STABILIZATION PROTOCOL V2.0</p>
+    <button id="btn-start">INITIALIZE SENSORS</button>
+  </div>
 
-  <div id="container">
+  <div id="viewfinder">
     <video id="v" autoplay playsinline muted></video>
-    <div id="hud">
-      <div id="stats">ROLL: 0.0°</div>
-      <div class="horizon-wire"></div>
-      <div style="text-align: right;">STATUS: ACTIVE</div>
+    
+    <div id="hud-layer">
+      <div id="readout">ROLL: 0.0°</div>
+      <div class="horizon-line"></div>
+      <div class="crosshair"></div>
+      <div style="text-align: right; font-size: 0.7rem;">GYRO: ACTIVE</div>
     </div>
   </div>
 
   <script>
     const v = document.getElementById('v');
-    const stats = document.getElementById('stats');
-    const btn = document.getElementById('btn-init');
+    const readout = document.getElementById('readout');
+    const overlay = document.getElementById('overlay');
+    const btn = document.getElementById('btn-start');
 
-    async function start() {
-      btn.style.display = 'none';
-      
-      // 1. Setup Camera
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment' } 
-      });
-      v.srcObject = stream;
+    let targetRoll = 0;
+    let currentRoll = 0;
+    
+    // --- CALIBRATION SETTINGS ---
+    const SMOOTHING = 0.12;    // Lower = smoother/slower (0.05 to 0.2)
+    const SENSITIVITY = 1.0;   // 1.0 is 1:1 movement. Adjust if it feels "too strong"
 
-      // 2. Request Orientation Permission (Required for iOS)
-      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-        await DeviceOrientationEvent.requestPermission();
+    async function init() {
+      try {
+        // 1. Camera Request
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: 'environment', width: { ideal: 1920 } } 
+        });
+        v.srcObject = stream;
+
+        // 2. iOS Permission Request
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+          const permission = await DeviceOrientationEvent.requestPermission();
+          if (permission !== 'granted') return alert("Sensor access denied");
+        }
+
+        overlay.style.display = 'none';
+
+        // 3. Sensor Listener
+        window.addEventListener('deviceorientation', (e) => {
+          const isLandscape = Math.abs(window.orientation) === 90;
+          let raw;
+
+          if (isLandscape) {
+            // In landscape, beta is our roll axis
+            raw = (window.orientation === 90) ? e.beta : -e.beta;
+          } else {
+            // In portrait, gamma is our roll axis
+            raw = -e.gamma; 
+          }
+
+          targetRoll = raw * SENSITIVITY;
+        });
+
+        // 4. Smooth Animation Loop
+        function animate() {
+          // Lerp formula: Current + (Target - Current) * Factor
+          currentRoll += (targetRoll - currentRoll) * SMOOTHING;
+
+          // Apply rotation. translate(-50%, -50%) keeps it centered
+          v.style.transform = `rotate(${currentRoll}deg) scale(1.3)`;
+          
+          readout.innerText = `ROLL: ${currentRoll.toFixed(1)}°`;
+          requestAnimationFrame(animate);
+        }
+        animate();
+
+      } catch (err) {
+        alert("Error: " + err.message);
       }
-
-      // 3. Listen for tilt
-      window.addEventListener('deviceorientation', (e) => {
-        // We negate e.gamma to counter-rotate against the phone's movement
-        const roll = -(e.gamma || 0); 
-        
-        // Apply rotation + slight zoom to hide black corners
-        v.style.transform = `rotate(${roll}deg) scale(1.4)`;
-        stats.innerText = `ROLL: ${roll.toFixed(1)}°`;
-      });
     }
 
-    btn.onclick = start;
+    btn.onclick = init;
   </script>
 </body>
 </html>
